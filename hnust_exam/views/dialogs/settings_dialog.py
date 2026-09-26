@@ -6,10 +6,14 @@ PushSettingCard / SmoothScrollArea 等），业务逻辑与原实现保持一致
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import sys
+import tempfile
 from threading import Thread
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QPropertyAnimation, QEasingCurve, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDialog,
@@ -44,7 +48,10 @@ from qfluentwidgets import (
 )
 
 from hnust_exam.services.config_manager import ConfigManager
-from hnust_exam.services.update_checker import fetch_update_info
+from hnust_exam.services.update_checker import (
+    describe_check_error,
+    fetch_update_info_with_status,
+)
 from hnust_exam.utils import constants
 from hnust_exam.utils.theme import Theme
 from hnust_exam.utils.ui_helpers import (
@@ -68,6 +75,15 @@ QPushButton, QLineEdit, QComboBox, QProgressBar, QSlider {
 """
 
 _STRICTNESS_VALUES = ["strict", "normal", "lenient"]
+
+# UI 常量定义
+_COMBO_WIDTH = 110
+_FONT_SCALE_MIN = 80
+_FONT_SCALE_MAX = 150
+_DEFAULT_FONT_SCALE = 100
+_CARD_MARGIN_TOP = 16
+_CARD_MARGIN_BOTTOM = 14
+_CARD_MARGIN_LEFT_RIGHT = 16
 
 
 class _SectionCard(CardWidget):
@@ -101,6 +117,7 @@ class SettingsDialog(QDialog):
         self._marks_cleared = False
         self._checking_update = False
         self._checking_qb = False
+        self._theme_animation = None  # 主题切换动画
 
         self._cfg = config_mgr.load_config()
         self._show_immediately = self._cfg.get("show_answer_immediately", False)
@@ -269,7 +286,7 @@ class SettingsDialog(QDialog):
         outer.addWidget(header)
 
         content = QVBoxLayout()
-        content.setContentsMargins(16, 10, 16, 14)
+        content.setContentsMargins(_CARD_MARGIN_LEFT_RIGHT, 10, _CARD_MARGIN_LEFT_RIGHT, _CARD_MARGIN_BOTTOM)
         content.setSpacing(8)
         outer.addLayout(content)
         return card, content
@@ -343,7 +360,7 @@ class SettingsDialog(QDialog):
         )
         self._strictness_combo = ComboBox()
         self._strictness_combo.addItems(["严格", "标准", "宽松"])
-        self._strictness_combo.setFixedWidth(110)
+        self._strictness_combo.setFixedWidth(_COMBO_WIDTH)
         strictness_map = {"strict": 0, "normal": 1, "lenient": 2}
         self._strictness_combo.setCurrentIndex(
             strictness_map.get(self._cfg.get("grading_strictness", "normal"), 1)
@@ -381,7 +398,7 @@ class SettingsDialog(QDialog):
         sr.setSpacing(12)
 
         self._scale_slider = Slider(Qt.Orientation.Horizontal)
-        self._scale_slider.setRange(80, 150)
+        self._scale_slider.setRange(_FONT_SCALE_MIN, _FONT_SCALE_MAX)
         self._scale_slider.setValue(int(Theme._font_scale * 100))
         self._scale_slider.valueChanged.connect(self._on_scale_changed)
         sr.addWidget(self._scale_slider, 1)
@@ -430,12 +447,41 @@ class SettingsDialog(QDialog):
         # 预览字号变了，卡片高度要跟着重新算，否则文字会被裁掉
         self._appearance_card.sync_height()
         self._update_hint()
-
+        
     def _on_dark_preview(self) -> None:
-        """深色开关切换时即时预览（点完成才写入配置，取消会还原）."""
-        self._sync_fluent_theme(self.dark_check.switchButton.isChecked())
-        self._apply_local_style()
+        """深色开关切换时即时预览（点完成才写入配置，取消会还原）.
+            
+        添加平滑过渡动画，提升视觉体验。
+        """
+        dark = self.dark_check.switchButton.isChecked()
+        self._animate_theme_transition(dark)
         self._update_hint()
+        
+    def _animate_theme_transition(self, dark: bool) -> None:
+        """播放主题切换动画.
+            
+        Args:
+            dark: 目标主题状态（True=深色，False=浅色）
+        """
+        # 如果已有动画正在播放，先停止它
+        if self._theme_animation and self._theme_animation.state() == QPropertyAnimation.State.Running:
+            self._theme_animation.stop()
+            
+        # 创建新的动画
+        self._theme_animation = QPropertyAnimation(self, b"palette")
+        self._theme_animation.setDuration(200)  # 200ms 过渡
+        self._theme_animation.setEasingCurve(QEasingCurve.Type.OutCubic)  # 缓动曲线，更自然
+            
+        # 执行颜色渐变效果
+        self._sync_fluent_theme(dark)
+        self._apply_local_style()
+            
+        # 动画结束后清理
+        def on_animation_finished():
+            self._theme_animation = None
+            
+        self._theme_animation.finished.connect(on_animation_finished)
+        self._theme_animation.start()
 
     # ───────── 更新 ─────────
 
@@ -451,6 +497,32 @@ class SettingsDialog(QDialog):
         )
         self._check_update_card.clicked.connect(self._check_update_now)
         group.addSettingCard(self._check_update_card)
+
+        # ── 已跳过的更新提示 ──
+        # 「跳过此版本」是永久生效的精确匹配，以前没有任何恢复入口：
+        # 误点一次就再也收不到该版本的提示，表现出来就是"这软件不提醒我更新"。
+        self._skip_card, skip_content = self._make_section(
+            FIF.REMOVE, "已跳过的更新", "清除记录后，该版本的更新提示会重新出现", group
+        )
+        skipped = self.config_mgr.load_skip_version()
+        self._skip_version_label = CaptionLabel(
+            f"已跳过：{skipped}" if skipped else "没有已跳过的版本"
+        )
+        skip_content.addWidget(self._skip_version_label)
+
+        skip_btn_row = QWidget()
+        sbr = QHBoxLayout(skip_btn_row)
+        sbr.setContentsMargins(0, 0, 0, 0)
+        sbr.setSpacing(8)
+        self._clear_skip_btn = PushButton("恢复更新提示")
+        self._clear_skip_btn.setEnabled(bool(skipped))
+        self._clear_skip_btn.clicked.connect(self._clear_skipped_version)
+        sbr.addWidget(self._clear_skip_btn)
+        sbr.addStretch(1)
+        skip_content.addWidget(skip_btn_row)
+
+        self._skip_card.sync_height()
+        group.addSettingCard(self._skip_card)
 
         card, content = self._make_section(
             FIF.CLOUD_DOWNLOAD, "题库更新", "从 Gitee 远程检查并同步最新题库文件", group
@@ -512,12 +584,15 @@ class SettingsDialog(QDialog):
         self._check_qb_btn.setText("检查中..." if not force else "更新中...")
         self._show_qb_progress(True, "正在连接...")
         self._qb_progress_bar.setValue(0)
-
+            
+        import time
+        self._update_start_time = time.time()  # 记录开始时间用于 ETA 计算
+    
         from hnust_exam.services.resource_pack_updater import (
             PackUpdateResult,
             check_pack_update_async,
         )
-
+    
         def _on_progress(downloaded: int, total: int) -> None:
             if total > 0:
                 pct = int(downloaded * 100 / total)
@@ -525,10 +600,19 @@ class SettingsDialog(QDialog):
                 if downloaded >= total:
                     self._qb_progress_label.setText("正在完成更新...")
                 else:
+                    # 智能显示格式：使用 MB/GB 自动切换
+                    current = self._format_size(downloaded)
+                    total_str = self._format_size(total)
+                        
+                    # 估算剩余时间
+                    elapsed = time.time() - self._update_start_time
+                    eta_seconds = (elapsed / downloaded * (total - downloaded)) if downloaded > 0 else 0
+                    eta_str = self._format_eta(eta_seconds)
+                        
                     self._qb_progress_label.setText(
-                        f"下载中: {pct}% ({downloaded // 1024}KB / {total // 1024}KB)"
+                        f"{pct}% • {current}/{total_str} • 预计 {eta_str}"
                     )
-
+    
         def _on_status(text: str) -> None:
             self._qb_progress_label.setText(text)
 
@@ -626,7 +710,18 @@ class SettingsDialog(QDialog):
         for k in old_cfg:
             if k not in new_cfg:
                 new_cfg[k] = old_cfg[k]
-        self.config_mgr.save_config(new_cfg)
+        
+        # 使用原子保存，防止崩溃导致配置丢失
+        try:
+            self._save_config_atomically(new_cfg)
+        except Exception as e:
+            themed_critical(
+                self,
+                "保存失败",
+                f"配置文件保存失败：{str(e)}\n请检查磁盘空间或权限。",
+            )
+            return
+        
         self.accept()
 
     def _on_cancel(self) -> None:
@@ -637,7 +732,14 @@ class SettingsDialog(QDialog):
 
         对话框里的字体滑块和深色开关都是即时预览，只有点「完成」才写配置。
         这里统一兜底，避免用右上角 X 关闭时把预览状态泄漏到主界面。
+        
+        如果正在播放动画，先等待动画结束再关闭。
         """
+        # 如果有动画正在播放，等待它结束
+        if self._theme_animation and self._theme_animation.state() == QPropertyAnimation.State.Running:
+            self._theme_animation.stop()
+            self._theme_animation = None
+        
         Theme._font_scale = self._orig_scale
         Theme.update_fonts()
         Theme.set_dark_mode(self._orig_dark)
@@ -681,6 +783,19 @@ class SettingsDialog(QDialog):
             self._marks_cleared = True
             themed_info(self, "完成", "所有标记已清除")
 
+    def _clear_skipped_version(self) -> None:
+        """清除「跳过此版本」标记.
+
+        写空串就够了：``_is_update_needed`` 比较的是 ``skip_ver == 远程版本号``，
+        空串永远不相等，于是所有版本重新参与提示。
+        """
+        self.config_mgr.save_skip_version("")
+        self._skip_version_label.setText("没有已跳过的版本")
+        self._clear_skip_btn.setEnabled(False)
+        # 文字变短会影响卡片高度
+        self._skip_card.sync_height()
+        themed_info(self, "已恢复", "之后检测到新版本会正常提示更新。")
+
     def _check_update_now(self) -> None:
         if self._checking_update:
             return
@@ -696,16 +811,28 @@ class SettingsDialog(QDialog):
 
         def _worker():
             try:
-                info = fetch_update_info(self.config_mgr)
+                info, error = fetch_update_info_with_status(self.config_mgr)
                 if info is None:
-                    sig.done.emit(None)  # 网络错误
+                    # error 带着每个源各自的失败原因
+                    # （manifest:empty;gitee:rate_limit;github:network），
+                    # 比过去那句一律的"网络连接失败"有用得多。
+                    sig.done.emit({
+                        "error_type": "check_failed",
+                        "message": describe_check_error(error),
+                    })
                 elif info.get("no_update"):
                     info["update_available"] = False
                     sig.done.emit(info)  # 已是最新
                 else:
                     sig.done.emit(info)  # 有更新
-            except Exception:
-                sig.done.emit(None)
+            except Exception as e:
+                # fetch_update_info_with_status 已经把网络异常消化掉了，
+                # 走到这里说明是意料之外的错误，照实报，不再猜错误类型。
+                logging.getLogger(__name__).exception("检查更新失败")
+                sig.done.emit({
+                    "error_type": "unknown",
+                    "message": f"检查更新失败：{e}",
+                })
 
         Thread(target=_worker, daemon=True).start()
 
@@ -714,6 +841,16 @@ class SettingsDialog(QDialog):
         self._check_update_card.button.setEnabled(True)
         self._check_update_card.button.setText("检查更新")
 
+        # 处理错误情况：具体原因已由 update_checker 按源汇总好，直接展示
+        if isinstance(info, dict) and "error_type" in info:
+            themed_warning(
+                self,
+                "检查失败",
+                info.get("message") or "无法获取版本信息，请稍后重试",
+            )
+            return
+        
+        # 原来的正常流程
         if not info:
             themed_warning(
                 self,
@@ -726,10 +863,21 @@ class SettingsDialog(QDialog):
         latest_version = info["latest_ver"]
 
         if not info.get("update_available", True):
+            # 把"版本从哪个源读到的"一起显示：以前这里只有一句"已经是最新"，
+            # 可万一清单源挂了、降级到 Gitee 而 Gitee 上是陈旧数据，用户看到的
+            # 和真相同得一塌糊涂。现在只要把这行截图发过来就能定位问题。
+            source_labels = {
+                "manifest": "官方版本清单（正常）",
+                "gitee": "Gitee —— 版本清单不可用，已降级",
+                "github": "GitHub —— 版本清单与 Gitee 均不可用，已降级",
+            }
+            source = info.get("source", "")
+            source_text = source_labels.get(source, "未知来源")
             themed_info(
                 self,
                 "检查更新",
-                f"已经是最新版本啦！\n\n当前版本：{current_version}\n最新版本：{latest_version}",
+                f"已经是最新版本啦！\n\n当前版本：{current_version}\n"
+                f"最新版本：{latest_version}\n版本来源：{source_text}",
             )
             return
 
@@ -738,6 +886,68 @@ class SettingsDialog(QDialog):
         dlg = UpdateDialog(info, self.config_mgr, self)
         dlg.exec()
 
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        """智能格式化文件大小 (自动切换 B/KB/MB/GB).
+        
+        Args:
+            size_bytes: 字节数
+            
+        Returns:
+            格式化后的大小字符串，如 "1.5MB"
+        """
+        if size_bytes < 1024:
+            return f"{size_bytes}B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f}KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f}MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.1f}GB"
+    
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        """格式化预计剩余时间.
+        
+        Args:
+            seconds: 秒数
+            
+        Returns:
+            格式化后的时间字符串，如 "2 分钟 30 秒"
+        """
+        if seconds < 60:
+            return f"{int(seconds)}秒"
+        elif seconds < 3600:
+            minutes = int(seconds // 60)
+            remaining_seconds = int(seconds % 60)
+            return f"{minutes}分{remaining_seconds}秒"
+        else:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}分{minutes}分"
+    
+    def _save_config_atomically(self, new_cfg: dict) -> None:
+        """原子方式保存配置文件，防止崩溃导致数据丢失.
+        
+        Args:
+            new_cfg: 要保存的配置字典
+        """
+        config_dir = os.path.dirname(constants.CONFIG_FILE)
+        os.makedirs(config_dir, exist_ok=True)
+        
+        fd, temp_path = tempfile.mkstemp(dir=config_dir, suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(new_cfg, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, constants.CONFIG_FILE)  # 原子操作
+        except Exception:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass  # 忽略删除失败
+            raise
+    
     @staticmethod
     def _get_current_version() -> str:
         """读取当前版本号.

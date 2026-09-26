@@ -23,6 +23,12 @@ export default {
     const url = new URL(request.url);
 
     try {
+      if (request.method === "GET" && url.pathname === "/api/version") {
+        return handleGetVersion(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/version") {
+        return handlePublishVersion(request, env);
+      }
       if (request.method === "POST" && url.pathname === "/api/heartbeat") {
         return handleHeartbeat(request, env);
       }
@@ -87,6 +93,82 @@ async function incr(env, key, n = 1) {
   const val = (parseInt(raw, 10) || 0) + n;
   await env.HNUST_TELEMETRY.put(key, String(val));
   return val;
+}
+
+// ── 版本清单（更新检测的第一优先源）─────────────────────
+// 客户端 hnust_exam/services/update_checker.py::fetch_manifest_info 消费这里
+// 返回的 JSON，字段名必须与那边保持一致：
+//   version / notes / published_at / force / release_url / assets[].{name,os,size,sha256,urls}
+//
+// 为什么要有这一块：直接查 Gitee/GitHub Release 列表会踩三个坑——两个平台漏同步
+// 一边就永远检测不到新版本、Gitee 列表排序分页不稳、GitHub API 按 IP 限流 60 次/小时
+// （机房共用出口几个人就打光）。版本真相收敛到这里之后，发版只改一个 KV 值。
+const RELEASE_KEY = "release:latest";
+
+// 只接受干净的语义化版本号。手滑写成 "v1.1.9（修复版）" 会被客户端判为脏数据，
+// 表现为"发了新版但所有用户显示已是最新"，所以在入口就拦住。
+const VERSION_RE = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
+async function handleGetVersion(request, env) {
+  const raw = await env.HNUST_TELEMETRY.get(RELEASE_KEY);
+  if (!raw) {
+    // 返回 404 而不是空 JSON：客户端据此判定"清单尚未发布"，
+    // 会安静降级到 Gitee/GitHub，不会影响老版本用户正常使用。
+    return json({ error: "no_release_yet" }, 404);
+  }
+  return new Response(raw, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      // 版本一小时最多变一次；缓存 5 分钟足够挡住机房同一出口的大量重复请求
+      "Cache-Control": "public, max-age=300",
+    },
+  });
+}
+
+async function handlePublishVersion(request, env) {
+  const url = new URL(request.url);
+  const token = url.searchParams.get("token") || request.headers.get("X-Admin-Token");
+  if (!token || token !== env.ADMIN_TOKEN) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  const body = await readJson(request);
+  const version = String(body.version || "").trim();
+  if (!VERSION_RE.test(version)) {
+    return json({ error: `version 必须形如 v1.2.3，实际收到: ${version || "(空)"}` }, 400);
+  }
+
+  const rawAssets = Array.isArray(body.assets) ? body.assets : [];
+  const assets = rawAssets
+    .map((a) => ({
+      name: String(a.name || "").trim(),
+      os: String(a.os || "windows").trim().toLowerCase(),
+      size: Number(a.size) || 0,
+      sha256: String(a.sha256 || "").trim().toLowerCase(),
+      urls: (Array.isArray(a.urls) ? a.urls : []).map((u) => String(u).trim()).filter(Boolean),
+    }))
+    // 名字必须以 .exe 结尾客户端才会选它作为 Windows 安装包
+    .filter((a) => a.name && a.urls.length > 0);
+
+  if (assets.length === 0) {
+    return json({ error: "assets 至少需要一个带 urls 的条目" }, 400);
+  }
+
+  const manifest = {
+    schema: 1,
+    version,
+    notes: String(body.notes || ""),
+    published_at: body.published_at || new Date().toISOString(),
+    force: body.force === true,
+    release_url: String(body.release_url || ""),
+    assets,
+    updated_at: new Date().toISOString(),
+  };
+
+  await env.HNUST_TELEMETRY.put(RELEASE_KEY, JSON.stringify(manifest, null, 2));
+  return json({ status: "ok", version, asset_count: assets.length });
 }
 
 // ── 收集统计数据（无 list 操作）─────────────────────────

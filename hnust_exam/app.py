@@ -1,4 +1,7 @@
-"""应用入口：初始化 QApplication、主题、主窗口."""
+"""应用入口：初始化 QApplication、主题、主窗口.
+
+包含全局渲染质量配置，优化字体显示、抗锯齿、高 DPI 支持等。
+"""
 
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 
 from hnust_exam.services.config_manager import ConfigManager
 from hnust_exam.utils.helpers import get_resource_path
+from hnust_exam.utils.render_config import apply_render_quality
 from hnust_exam.utils.theme import Theme
 from hnust_exam.views.main_window import MainWindow
 
@@ -66,9 +70,13 @@ def run() -> None:
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
-
+    
     app = QApplication(sys.argv)
-    app.setApplicationName("HNUST仿真平台")
+        
+    # 应用全局渲染质量配置（优化字体、抗锯齿、图片等）
+    apply_render_quality(app)
+        
+    app.setApplicationName("HNUST 仿真平台")
     app.setOrganizationName("HNUST")
 
     # 设置应用全局图标（任务栏 + 窗口）
@@ -85,9 +93,10 @@ def run() -> None:
     Theme.update_fonts()
     Theme.set_dark_mode(cfg.get("dark_mode", False))
 
-    # 设置全局字体
+    # 设置全局字体（合并 render_config 中的优化配置）
     font = QFont("Microsoft YaHei", max(8, int(11 * Theme._font_scale)))
-    font.setHintingPreference(QFont.PreferNoHinting)
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)  # 优先使用抗锯齿
+    font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)  # 完整字体提示
     app.setFont(font)
 
     # 设置全局样式表
@@ -105,10 +114,15 @@ def run() -> None:
     # 启动时异步检查更新
     def _on_update_result(info):
         if info is None:
-            logger.info("更新检查完成：网络不可用")
+            logger.warning("更新检查失败：版本清单与备用源（Gitee/GitHub）均无法连接")
             return
         if info.get("no_update"):
-            logger.info("更新检查完成：已是最新版本")
+            # 把版本源一起记下来。用户反馈"明明发了新版却不提示"时，
+            # 这行日志能直接区分"确实没更新"和"某个源返回了陈旧数据"。
+            logger.info(
+                "更新检查完成：已是最新版本（源=%s，远程=%s）",
+                info.get("source", "?"), info.get("latest_ver", "?"),
+            )
             return
         from hnust_exam.views.dialogs.update_dialog import UpdateDialog
         dlg = UpdateDialog(info, config_mgr, main_window)

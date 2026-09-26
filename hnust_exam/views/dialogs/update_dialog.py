@@ -31,11 +31,21 @@ class _DownloadThread(QThread):
     progress = Signal(int, float, int)
     finished = Signal(bool, str)
 
-    def __init__(self, url: str, save_path: str, expected_size: int) -> None:
+    def __init__(
+        self,
+        url: str,
+        save_path: str,
+        expected_size: int,
+        expected_sha256: str = "",
+        urls: list[str] | None = None,
+    ) -> None:
         super().__init__()
         self._url = url
         self._save_path = save_path
         self._expected_size = expected_size
+        self._expected_sha256 = expected_sha256
+        # 版本清单可以给多个镜像，断了就换下一个继续续传
+        self._urls = urls or []
         self._stop_flag = False
 
     def request_stop(self) -> None:
@@ -55,7 +65,13 @@ class _DownloadThread(QThread):
             return
 
         ok, msg = download_file(
-            self._url, self._save_path, _on_progress, self._expected_size,
+            self._url,
+            self._save_path,
+            _on_progress,
+            self._expected_size,
+            expected_sha256=self._expected_sha256,
+            urls=self._urls,
+            should_cancel=lambda: self._stop_flag,
         )
         if self._stop_flag and not ok:
             self.finished.emit(False, "下载已取消")
@@ -462,8 +478,14 @@ class UpdateDialog(QDialog):
 
         temp_path = get_temp_download_path()
         expected_size = self._info.get("expected_size", 0)
+        # sha256 和镜像列表只有版本清单源会给；降级到平台 Release 时为空，
+        # download_file 会自动退回"只用 url、只校验大小"的旧行为。
+        expected_sha256 = self._info.get("sha256", "")
+        mirrors = self._info.get("download_urls") or [url]
 
-        self._download_thread = _DownloadThread(url, temp_path, expected_size)
+        self._download_thread = _DownloadThread(
+            url, temp_path, expected_size, expected_sha256, mirrors,
+        )
         self._download_thread.progress.connect(self._on_download_progress)
         self._download_thread.finished.connect(
             lambda ok, msg: self._on_download_finished(ok, msg, temp_path),

@@ -58,7 +58,9 @@
   - `config_manager.py`：配置和进度读写。
   - `backup_manager.py`：程序题文件备份与恢复。
   - `python_env.py`：查找系统 Python，调用 IDLE 打开程序题文件。
-  - `update_checker.py`：GitHub Release 更新检查。
+  - `update_checker.py`：软件更新检查。版本源优先级为 **Worker 版本清单 → Gitee Release → GitHub Release**，详见第 4 节「更新检测」。
+  - `auto_updater.py`：下载新版本 exe（多镜像轮换 + 断点续传 + sha256 校验），并把替换交给外部脚本完成。
+  - `resource_pack_updater.py`：题库整包热更新（从 Gitee 下载 zip 替换本地题库）。
   - `telemetry.py`：遥测相关逻辑。
 - `hnust_exam/views/`：PySide6 界面。
   - `main_window.py`：主窗口和页面切换。
@@ -176,6 +178,56 @@ dist/HNUST仿真平台.exe
 改 GitHub 更新检测仓库：
 
 - 修改 `hnust_exam/utils/constants.py` 里的 `GITHUB_USERNAME` 和 `GITHUB_REPO_NAME`。
+- 同时确认 `GITEE_OWNER` / `GITEE_UPDATE_REPO`（下载镜像）和 `UPDATE_MANIFEST_URL`（版本清单）是否要跟着改。
+
+### 更新检测（重要，改动前务必读）
+
+软件更新走**三级版本源**，顺序在 `update_checker.fetch_update_info_with_status()` 里：
+
+1. **Worker 版本清单** `GET /api/version` —— 权威源。发版时由作者把最新版本号 POST 进 Cloudflare KV（键 `release:latest`），客户端只问这一个固定地址。
+2. **Gitee Release** —— 清单不可达时降级（`per_page=100` 翻页 + 遍历取最高版本）。
+3. **GitHub Release** —— Gitee 也不可达时兜底，再回填 Gitee 下载镜像。
+
+`cloudflare-worker/worker.js` 的 `handleGetVersion` / `handlePublishVersion` 与 `update_checker.fetch_manifest_info()` 是**同一份字段契约**，改一边必须改另一边：
+`version` / `notes` / `published_at` / `force` / `release_url` / `assets[].{name,os,size,sha256,urls}`。
+`assets[].name` **必须以 `.exe` 结尾**，否则客户端 `_pick_exe_asset` 不认（它只认 `.exe`，不再兜底取第一个——实测 release 里同时挂着 `HNUST.exe` 和 `HNUST.dmg`，兜底会把 dmg 当 Windows 包下载）。
+
+> 这套结构是用六个真实故障换来的，别退回旧写法：
+>
+> 1. **别让平台 Release 当版本裁决者**。旧代码把 Gitee 当权威源，`if info: ... return {"no_update": True}`
+>    之后**根本不再查 GitHub**。只要某次发版漏同步 Gitee，全体用户永久收不到更新，
+>    而且界面明确显示"已是最新版本"——比报错更难排查。README 还写着 GitHub 是唯一正版发布地址，角色是矛盾的。
+> 2. **Gitee release 列表既排序不稳又不分页**。实测返回顺序是 `v1.1.4 … v1.0.0-beta.1, v1.1.5, v1.1.6, v1.1.7, v1.1.8`
+>    ——最新的排在末尾；而接口默认 `per_page=20`，只读第一页的话 release 一多，新版本落在第二页就永远看不见。
+>    必须**遍历 + 翻页**两件事同时做对。
+> 3. **失败原因不能被压成一个 None**。GitHub API 匿名调用按 **IP** 限流 60 次/小时，
+>    机房共用出口时几个人就打光；`timeout=5` 对国内访问 GitHub 也常常不够。
+>    旧代码把这些全吞成 `None`，设置页里 `timeout` / `rate_limit` 的错误分类分支因此**永远执行不到**
+>    （异常在 `fetch_*` 内部就被 except 掉了）。现在用 `_http_get_json()` 返回 `error_kind`，
+>    并用 `describe_check_error()` 转成用户能看懂的话。
+> 4. **`"已是最新"` 要能自查**。`fetch_update_info` 的返回一律带 `source` 和远程版本号，
+>    设置页把它们显示出来。用户截图发过来就能立刻区分"确实没更新"和"某个源返回了陈旧数据"。
+> 5. **替换自身 exe 必须交给外部进程**。刚落盘的新 exe 会被 Defender 实时保护抓住扫描并短暂独占，
+>    本进程内 `shutil.move` 于是概率性 `PermissionError`——这就是"有时能更新有时失败"的来源。
+>    现在 `replace_and_restart()` 只做"当前 exe 改名让位"，剩下的交给 `HNUST_update_replace.cmd`
+>    轮询重试（最多 `REPLACE_TRIES` 次），失败则回滚旧版本再启动，脚本最后 `del "%~f0"` 自删。
+>    延时用 `ping -n 2 127.0.0.1`，**不要用 `timeout /t`**：分离进程里没有交互控制台，`timeout` 会报错。
+> 6. **续传只在 206 时追加**。服务器返回 200 表示它忽略了 `Range`、给的是全量内容，
+>    此时**必须 `wb` 覆盖重写**；往半截文件后面追加会得到一个坏 exe，而且大小校验都可能骗过去。
+>    实测 GitHub/Gitee 的 release asset 支持 Range（`206` + `content-range`）。注意 206 的
+>    `content-length` 只是分段长度，算总进度要加回已下载字节。
+
+**版本号解析有三套，别混用**：
+
+| 函数 | 用途 | 行为 |
+|---|---|---|
+| `helpers.version_tuple` + `is_valid_version` | 比较**手工创建的 Gitee/GitHub tag** | 宽松：`v1.1.9（修复版）`、尾部空格都要能读出 `(1,1,9)`；补齐到 3 段避免 `(1,1) < (1,1,9)` 误判 |
+| `helpers.is_semver_version` | 校验**自己写的清单字段** | 严格：带尾巴说明发布时就错了，当场拒绝并降级，而不是猜个版本推给全体用户 |
+| `utils.version.parse_version` | **题库**日期版本 `yyyy.mm.dd.tttt` | 补 0 到 4 段；拿它解析 `"v1.0.0"` 会得到 `(0,0,0,0)`（`test_version_comparison.py` 锁着这条断言），**绝不能**用在应用版本号上 |
+
+旧实现是 `tuple(int(x) for x in parts[0].split(".") if x.isdigit())`——解析不了的段**静默丢掉**：
+`v1.1.9（修复版）` → `(1,1)`、`Release-1.1.9` → `()`、`v1.1.9 ` → `(1,1)`，全都比本地 `(1,1,9)` 小，
+于是永久判定"远程比我还旧"，更新提示再也不出现且日志一个字都没有。**不要退回这种写法。**
 
 改判分逻辑：
 
@@ -309,11 +361,56 @@ dist/HNUST仿真平台.exe
 - `CURRENT_VERSION` 是否正确。
 - `README.md` 更新日志是否同步。
 - GitHub Release tag 是否和版本号一致。
+- Gitee Release 是否也建了同名 tag（它是第二优先源；长期落后会让降级路径给出陈旧答案）。
+- **版本清单是否已发布**：`cloudflare-worker/` 部署过、且已 POST 过 `/api/version`。
+  只发 Release 不写清单，等于新架构没生效——客户端会一直走降级老路子（能用，但回到旧风险）。
 - `requirements.txt` 是否包含新增依赖。
 - `HNUST仿真平台.spec` 是否包含必要资源。
 - `题库/` 是否能被打包后读取。
 - `python -m pytest tests/ -v` 是否通过。
 - `dist/HNUST仿真平台.exe` 是否能在干净环境启动。
+
+### 发版完整步骤（vX.Y.Z）
+
+```powershell
+# 1. 改版本号 + README 更新日志，确认测试通过
+.venv/Scripts/python.exe -m pytest tests/ -q
+
+# 2. 打包
+.venv/Scripts/pyinstaller.exe HNUST仿真平台.spec
+
+# 3. 取校验值（写清单要用）
+(Get-Item "dist\HNUST仿真平台.exe").Length
+(Get-FileHash "dist\HNUST仿真平台.exe" -Algorithm SHA256).Hash.ToLower()
+
+# 4. 在 GitHub 建 Release（tag = vX.Y.Z）并上传 exe；Gitee 建同名 Release
+
+# 5. 若 worker.js 有改动，部署 Worker
+cd cloudflare-worker; wrangler deploy; cd ..
+
+# 6. 发布版本清单（这一步决定老用户能不能收到更新提示）
+$body = @{
+    version = "vX.Y.Z"
+    notes   = "本次更新说明"
+    force   = $false
+    assets  = @(@{ name = "HNUST.exe"; os = "windows"
+                   size = <上面的字节数>; sha256 = "<上面的哈希>"
+                   urls = @("Gitee下载地址", "GitHub下载地址") })
+} | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Method Post `
+  -Uri "https://hnust-exam-telemetry.hnust-exam-stats.workers.dev/api/version?token=$env:ADMIN_TOKEN" `
+  -ContentType "application/json" -Body $body
+
+# 7. 验证清单已生效
+curl https://hnust-exam-telemetry.hnust-exam-stats.workers.dev/api/version
+```
+
+`/api/version` 只接受 `v大.小.补丁` 形式（可带 `-beta.1` 后缀），写成 `vX.Y.Z（修复版）`
+会被 Worker 直接 400 拒掉——这是故意的：脏版本号会流到几千台客户端上静默失效，
+远不如在发布入口就报错。
+
+> 版本清单暂时没配也不要紧：Worker 返回 404 时客户端识别为 `empty`，
+> 会安静降级到 Gitee/GitHub，行为与改造前一致。所以**部署 Worker 可以随时做，不会打断老用户**。
 
 ## 8. 题库 Excel 常见问题
 

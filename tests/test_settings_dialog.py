@@ -275,3 +275,54 @@ class TestMarkClearing:
         monkeypatch.setattr(sd, "themed_info", lambda *a, **k: None)
         dlg._clear_all_marks()
         assert dlg._marks_cleared is False
+
+
+# ───────── 恢复已跳过的更新提示 ─────────
+
+
+class TestSkippedUpdateReset:
+    """「跳过此版本」过去是永久且无解的：误点一次就再也收不到该版本提示."""
+
+    def test_card_shows_skipped_version_and_enables_button(self, app, cfg_mgr, theme_guard):
+        cfg_mgr.save_skip_version("v1.2.0")
+        dlg = _open(app, cfg_mgr)
+
+        assert "v1.2.0" in dlg._skip_version_label.text()
+        assert dlg._clear_skip_btn.isEnabled()
+
+    def test_button_disabled_when_nothing_skipped(self, app, cfg_mgr, theme_guard):
+        dlg = _open(app, cfg_mgr)
+        assert dlg._clear_skip_btn.isEnabled() is False
+        assert "没有" in dlg._skip_version_label.text()
+
+    def test_clicking_button_clears_marker(self, app, cfg_mgr, theme_guard, monkeypatch):
+        cfg_mgr.save_skip_version("v1.2.0")
+        dlg = _open(app, cfg_mgr)
+        import hnust_exam.views.dialogs.settings_dialog as sd
+
+        monkeypatch.setattr(sd, "themed_info", lambda *a, **k: None)
+        dlg._clear_skip_btn.click()
+
+        assert cfg_mgr.load_skip_version() == ""
+        assert dlg._clear_skip_btn.isEnabled() is False
+        assert "没有" in dlg._skip_version_label.text()
+
+    def test_cleared_marker_lets_update_prompt_again(self, cfg_mgr, monkeypatch):
+        """端到端确认「写空串」确实解除了跳过——判断逻辑在 update_checker 里."""
+        from hnust_exam.services import update_checker as uc
+
+        monkeypatch.setattr(uc, "CURRENT_VERSION", "v1.1.9")
+        cfg_mgr.save_skip_version("v1.2.0")
+        assert uc._is_update_needed("v1.2.0", cfg_mgr) is False
+
+        cfg_mgr.save_skip_version("")
+        assert uc._is_update_needed("v1.2.0", cfg_mgr) is True
+
+    def test_skip_card_is_not_squashed(self, app, cfg_mgr, theme_guard):
+        """新卡片同样必须 sync_height，否则会被 ExpandLayout 压成一条空白."""
+        cfg_mgr.save_skip_version("v1.2.0")
+        dlg = _open(app, cfg_mgr)
+        card = dlg._skip_card
+
+        assert card.height() == card.sizeHint().height()
+        assert card.height() > 60, "已跳过的更新卡片被压扁了"
