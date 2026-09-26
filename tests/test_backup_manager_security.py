@@ -29,7 +29,7 @@ def test_init_backup_rejects_parent_traversal(tmp_path, monkeypatch):
 
     exam = _Exam([_Question("../config.json")])
 
-    with pytest.raises(ValueError, match="不允许的程序文件路径"):
+    with pytest.raises(ValueError, match="非法的文件名"):
         BackupManager().init_backup("exam.xlsx", exam)
 
 
@@ -43,5 +43,5 @@ def test_restore_file_rejects_absolute_target(tmp_path, monkeypatch):
     manager = BackupManager()
     manager._backup_dir = str(tmp_path / "backup")
     (tmp_path / "backup").mkdir()
-    with pytest.raises(ValueError, match="不允许的程序文件路径"):
+    with pytest.raises(ValueError, match="非法的文件名"):
         manager.restore_file(str(tmp_path / "evil.py"), "exam.xlsx")

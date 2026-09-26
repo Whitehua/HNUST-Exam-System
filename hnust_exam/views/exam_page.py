@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QMessageBox,
     QProgressDialog,
+    QPlainTextEdit,
 )
 
 from hnust_exam.models.exam import Exam
@@ -48,11 +49,16 @@ class GradingWorker(QObject):
 
     def run(self) -> None:
         from hnust_exam.services.grader import grade_exam
+        
         try:
             results = grade_exam(self.exam, strictness=self.strictness)
-        except Exception:
-            results = []
-        self.finished.emit(results)
+            # 成功时 emit Signal
+            self.finished.emit(results)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception("判分过程中发生异常")
+            # 失败时也 emit Signal，但传递空列表
+            self.finished.emit([])
 
 
 class ExamPage(QWidget):
@@ -70,6 +76,9 @@ class ExamPage(QWidget):
         self._device_id: str = ""
         self.backup_mgr = BackupManager()
         self._grading_thread: QThread | None = None
+        # worker 必须被实例持有：PySide6 会回收无父对象的局部 QObject，
+        # 一旦被回收，finished 信号的所有连接随之失效，判分对话框将永远停留。
+        self._grading_worker: GradingWorker | None = None
         self._progress_dialog: QProgressDialog | None = None
 
         self._timer = QTimer(self)
@@ -323,6 +332,13 @@ class ExamPage(QWidget):
             super().keyPressEvent(event)
             return
 
+        # 检查是否在编辑控件中（QLineEdit、QTextEdit 等）
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            # 让编辑控件自己处理快捷键（Ctrl+A 全选等）
+            super().keyPressEvent(event)
+            return
+
         if event.isAutoRepeat():
             return
 
@@ -334,7 +350,7 @@ class ExamPage(QWidget):
             self.jump_next_unanswered()
             return
 
-        # Ctrl+A 查看答案
+        # Ctrl+A 查看答案（仅在非编辑状态下）
         if modifiers == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_A:
             self.show_answer()
             return
@@ -656,21 +672,36 @@ class ExamPage(QWidget):
 
     def _start_async_grading(self) -> None:
         """在后台线程中执行判分，不阻塞 UI."""
+        from PySide6.QtCore import Qt, QTimer
+        
         cfg = self.main_window.config_mgr.load_config()
         strictness = cfg.get("grading_strictness", "normal")
 
         self._grading_thread = QThread(self)
         worker = GradingWorker(self.exam, strictness)
+        self._grading_worker = worker  # 持有引用，防止被 GC 后信号连接失效
         worker.moveToThread(self._grading_thread)
         self._grading_thread.started.connect(worker.run)
-        worker.finished.connect(self._on_grading_done)
-        worker.finished.connect(self._grading_thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        self._grading_thread.finished.connect(self._grading_thread.deleteLater)
+        # 连接必须在 start() 之前：判分耗时很短，start 后再连可能错过 finished 信号。
+        # PySide6 的 connect 关键字是 type=（写 connectionType= 会直接 TypeError）。
+        worker.finished.connect(self._on_grading_done, type=Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._grading_thread.quit, type=Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(worker.deleteLater, type=Qt.ConnectionType.QueuedConnection)
+        self._grading_thread.finished.connect(self._grading_thread.deleteLater, type=Qt.ConnectionType.QueuedConnection)
         self._grading_thread.start()
+        
+        # 添加超时保护：如果 30 秒后还没有完成，强制终止
+        self._grading_timer = QTimer(self)
+        self._grading_timer.setSingleShot(True)
+        self._grading_timer.timeout.connect(lambda: self._on_grading_timeout())
+        self._grading_timer.start(30000)  # 30 秒超时
 
     def _on_grading_done(self, results: list[Result]) -> None:
         """判分完成后在主线程中执行后续操作."""
+        # 停止超时计时器
+        if hasattr(self, '_grading_timer') and self._grading_timer.isActive():
+            self._grading_timer.stop()
+        
         try:
             if self._progress_dialog:
                 self._progress_dialog.close()
@@ -686,6 +717,32 @@ class ExamPage(QWidget):
             if self._progress_dialog:
                 self._progress_dialog.close()
                 self._progress_dialog = None
+    
+    def _on_grading_timeout(self) -> None:
+        """判分超时处理."""
+        import logging
+        logging.getLogger(__name__).error("判分超时（30 秒），强制终止")
+        
+        # 停止计时器
+        if hasattr(self, '_grading_timer') and self._grading_timer.isActive():
+            self._grading_timer.stop()
+        
+        # 关闭进度对话框
+        if self._progress_dialog:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        
+        # 终止后台线程
+        if self._grading_thread and self._grading_thread.isRunning():
+            self._grading_thread.quit()
+            self._grading_thread.wait(5000)  # 等待最多 5 秒
+        
+        # 显示错误提示
+        themed_critical(
+            self,
+            "判分超时",
+            "判分过程耗时过长，已自动终止。\n请检查是否有程序题答案存在语法错误或死循环。"
+        )
 
     def _report_score(self, score_pct: float) -> None:
         """上报成绩到统计服务（静默，不阻塞）."""

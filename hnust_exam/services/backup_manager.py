@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from typing import TYPE_CHECKING
 
@@ -14,16 +15,55 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_program_file_path(program_file: str) -> str:
-    """校验程序文件名，拒绝绝对路径和目录穿越."""
-    normalized = os.path.normpath(program_file.strip())
+    """严格校验程序文件名，防止路径遍历攻击.
+    
+    校验规则：
+    1. 只允许字母、数字、下划线、连字符和点
+    2. 不允许路径分隔符
+    3. 不允许目录穿越（..）
+    4. 必须是相对路径
+    5. 最终路径必须在 base_dir 内
+    
+    Args:
+        program_file: 原始文件名
+        
+    Returns:
+        规范化后的文件名
+        
+    Raises:
+        ValueError: 文件名不合法
+    """
+    if not program_file or not isinstance(program_file, str):
+        raise ValueError("非法的文件名")
+    
+    # 去除首尾空白
+    filename = program_file.strip()
+    
+    # 检查是否为空
+    if not filename:
+        raise ValueError("非法的文件名")
+    
+    # 严格正则校验：只允许字母、数字、下划线、连字符、点
+    # 文件名不能以点开头（隐藏文件）
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*\.(py|c)$", filename):
+        raise ValueError("非法的文件名")
+    
+    # 规范化路径
+    normalized = os.path.normpath(filename)
+    
+    # 检查是否包含父目录引用
+    if os.pardir in normalized.split(os.sep):
+        raise ValueError("不允许的路径")
+    
+    # 检查是否为绝对路径或包含驱动器号
     drive, _ = os.path.splitdrive(normalized)
-    if not normalized or normalized in (".", os.pardir):
-        raise ValueError("不允许的程序文件路径")
     if drive or os.path.isabs(normalized):
-        raise ValueError("不允许的程序文件路径")
-    parts = normalized.replace("/", os.sep).split(os.sep)
-    if os.pardir in parts:
-        raise ValueError("不允许的程序文件路径")
+        raise ValueError("不允许的路径")
+    
+    # 双重检查：确保没有特殊字符
+    if any(c in normalized for c in ["//", "\\\\"]):
+        raise ValueError("不允许的路径")
+    
     return normalized
 
 

@@ -1,4 +1,32 @@
-"""主题数据管理（纯数据，不依赖GUI框架）."""
+"""主题数据管理（纯数据，不依赖 GUI 框架）.
+
+包含颜色、字体、渲染质量等全局显示配置。
+支持高 DPI 缩放、字体平滑、抗锯齿等高级渲染选项。
+"""
+
+from typing import Tuple
+
+# 渲染质量配置
+RENDER_QUALITY = {
+    # Qt 渲染质量级别 (0-3)
+    # 0: 默认，1: 低质量，2: 中等质量，3: 高质量
+    'ANTIALIASING': True,          # 启用抗锯齿
+    'TEXT_ANTIALIASING': True,     # 文本抗锯齿
+    'SMOOTH_PIXMAPS': True,        # 图片平滑
+    'HIGH_QUALITY_PAINTING': True, # 高质量绘画
+    
+    # 字体渲染优化
+    'FONT_HINTING': 'AUTO',        # 字体提示：NONE, AUTO, FULL
+    'FONT_SUBPIXEL_RENDERING': True,  # 子像素渲染
+    'FONT_FORCE_VERTICAL_LAYOUT': False,
+}
+
+# 高 DPI 配置
+DPI_CONFIG = {
+    'ENABLE_HIGH_DPI_SCALING': True,   # 启用高 DPI 自动缩放
+    'ALLOW_HIGH_DPI_SCALE_FACTOR': True,  # 允许设置缩放比例
+    'PIXEL_RATIO': None,               # 像素比 (None=自动)
+}
 
 
 class Theme:
@@ -81,13 +109,39 @@ class Theme:
     CRASH_BG = "#ffffff"
     CRASH_HEADER = "#dc2626"
 
-    # 字体
-    FONT = ("微软雅黑", 11)
-    FONT_BOLD = ("微软雅黑", 11, "bold")
-    FONT_TITLE = ("微软雅黑", 12, "bold")
-    FONT_HUGE = ("微软雅黑", 16, "bold")
-    FONT_SMALL = ("微软雅黑", 9)
-    FONT_TINY = ("微软雅黑", 7)
+    # 字体配置 - 优化版
+    # 使用更现代的字体栈，支持中文、英文、数字
+    FONT_FAMILY = "微软雅黑"  # 主字体（中文优化）
+    
+    # 基础字体大小（未缩放）
+    BASE_FONT_SIZE = 11
+    
+    # 字体家族列表（按优先级）
+    FONT_STACK = [
+        FONT_FAMILY,           # 首选：微软雅黑（中文优化）
+        "Segoe UI",            # 备选：Segoe UI（Windows 现代字体）
+        "Roboto",              # 备选：Roboto（Google 字体）
+        "Helvetica Neue",      # 备选：Helvetica Neue（Mac）
+        "Arial",               # 兜底：Arial
+        "sans-serif",          # 兜底：通用无衬线字体
+    ]
+    
+    # 不同用途的字体配置 (family, size, weight)
+    # weight: Normal(400), Medium(500), SemiBold(600), Bold(700)
+    FONT = (FONT_FAMILY, BASE_FONT_SIZE, 400)           # 普通文本
+    FONT_MEDIUM = (FONT_FAMILY, BASE_FONT_SIZE, 500)    # 中等字重
+    FONT_BOLD = (FONT_FAMILY, BASE_FONT_SIZE, 700)      # 粗体
+    
+    # 标题字体
+    FONT_TITLE = (FONT_FAMILY, 14, 700)     # 大标题
+    FONT_SUBTITLE = (FONT_FAMILY, 12, 600)  # 副标题
+    
+    # 特殊字体
+    FONT_HUGE = (FONT_FAMILY, 18, 700)      # 超大标题
+    FONT_LARGE = (FONT_FAMILY, 13, 500)     # 大号文本
+    FONT_SMALL = (FONT_FAMILY, 10, 400)     # 小号文本
+    FONT_TINY = (FONT_FAMILY, 8, 400)       # 超小文本
+    FONT_MONO = ("Consolas", 11, 400)       # 等宽字体（代码）
 
     @classmethod
     def set_dark_mode(cls, enabled: bool) -> None:
@@ -99,16 +153,64 @@ class Theme:
 
     @classmethod
     def update_fonts(cls) -> None:
-        """根据 _font_scale 更新所有字体大小."""
+        """根据 _font_scale 更新所有字体大小.
+        
+        支持动态缩放，同时保持合理的字体层级关系。
+        """
         s = cls._font_scale
-        cls.FONT = ("微软雅黑", max(8, int(11 * s)))
-        cls.FONT_BOLD = ("微软雅黑", max(8, int(11 * s)), "bold")
-        cls.FONT_TITLE = ("微软雅黑", max(9, int(12 * s)), "bold")
-        cls.FONT_HUGE = ("微软雅黑", max(12, int(16 * s)), "bold")
-        cls.FONT_SMALL = ("微软雅黑", max(7, int(9 * s)))
-        cls.FONT_TINY = ("微软雅黑", max(6, int(7 * s)))
+        
+        # 基础文本字体
+        size = max(8, int(cls.BASE_FONT_SIZE * s))
+        cls.FONT = (cls.FONT_FAMILY, size, 400)
+        cls.FONT_MEDIUM = (cls.FONT_FAMILY, size, 500)
+        cls.FONT_BOLD = (cls.FONT_FAMILY, size, 700)
+        
+        # 标题字体（保持层级差异）
+        cls.FONT_TITLE = (cls.FONT_FAMILY, max(12, int(14 * s)), 700)
+        cls.FONT_SUBTITLE = (cls.FONT_FAMILY, max(10, int(12 * s)), 600)
+        
+        # 特殊字体
+        cls.FONT_HUGE = (cls.FONT_FAMILY, max(16, int(18 * s)), 700)
+        cls.FONT_LARGE = (cls.FONT_FAMILY, max(11, int(13 * s)), 500)
+        cls.FONT_SMALL = (cls.FONT_FAMILY, max(9, int(10 * s)), 400)
+        cls.FONT_TINY = (cls.FONT_FAMILY, max(7, int(8 * s)), 400)
+        cls.FONT_MONO = ("Consolas", max(9, int(11 * s)), 400)
 
     @classmethod
     def get_current_colors(cls) -> dict:
         """获取当前主题的所有颜色."""
         return cls._DARK if cls._is_dark else cls._LIGHT
+    
+    @classmethod
+    def set_render_quality(cls, quality: str = 'high') -> None:
+        """设置全局渲染质量.
+        
+        Args:
+            quality: 质量级别 ('low', 'medium', 'high', 'ultra')
+        """
+        quality_map = {
+            'low': {'ANTIALIASING': False, 'TEXT_ANTIALIASING': False,
+                    'SMOOTH_PIXMAPS': False, 'HIGH_QUALITY_PAINTING': False},
+            'medium': {'ANTIALIASING': True, 'TEXT_ANTIALIASING': True,
+                       'SMOOTH_PIXMAPS': True, 'HIGH_QUALITY_PAINTING': False},
+            'high': {'ANTIALIASING': True, 'TEXT_ANTIALIASING': True,
+                     'SMOOTH_PIXMAPS': True, 'HIGH_QUALITY_PAINTING': True},
+            'ultra': {'ANTIALIASING': True, 'TEXT_ANTIALIASING': True,
+                      'SMOOTH_PIXMAPS': True, 'HIGH_QUALITY_PAINTING': True,
+                      'FONT_HINTING': 'FULL', 'FONT_SUBPIXEL_RENDERING': True},
+        }
+        
+        settings = quality_map.get(quality, quality_map['high'])
+        for key, value in settings.items():
+            RENDER_QUALITY[key] = value
+    
+    @classmethod
+    def enable_high_dpi(cls, scale_factor: float | None = None) -> None:
+        """启用高 DPI 支持.
+        
+        Args:
+            scale_factor: 缩放因子 (None=自动检测)
+        """
+        DPI_CONFIG['ENABLE_HIGH_DPI_SCALING'] = True
+        DPI_CONFIG['ALLOW_HIGH_DPI_SCALE_FACTOR'] = True
+        DPI_CONFIG['PIXEL_RATIO'] = scale_factor

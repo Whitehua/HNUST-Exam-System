@@ -2,13 +2,14 @@
 
 复刻万维考试系统（VFGRADE.EXE）核心判分逻辑，支持：
 - 单选/判断：归一化精确匹配
-- 多选：全对满分，部分对半分，超集0分
+- 多选：全对满分，部分对半分，超集 0 分
 - 填空：两阶段匹配（一次匹配 + 断词匹配）
-- 程序设计：分阶段评分（编译门槛 → 输出+关键字+代码加权）
+- 程序设计：分阶段评分（编译门槛 → 输出 + 关键字 + 代码加权）
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
@@ -19,6 +20,8 @@ import subprocess
 import tempfile
 import shutil
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from hnust_exam.models.result import Result
 from hnust_exam.services.config_manager import ConfigManager
@@ -382,6 +385,8 @@ def _run_limited(
 ) -> subprocess.CompletedProcess | None:
     """运行外部程序，超时时清理进程树."""
     creationflags = 0
+    proc_pid = None  # 保存进程 ID 用于后续清理
+    
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
@@ -395,26 +400,63 @@ def _run_limited(
         preexec_fn=preexec_fn,
         creationflags=creationflags,
     )
+    proc_pid = proc.pid  # 保存 PID
+    
     try:
         stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
     except subprocess.TimeoutExpired:
+        success = False
         try:
             if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                )
+                # Windows: 强制杀死整个进程树
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc_pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                        check=True,
+                    )
+                    success = True
+                except subprocess.SubprocessError:
+                    # 如果 taskkill 失败，尝试直接 kill 进程
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                        success = True
+                    except Exception:
+                        pass
             else:
-                proc.kill()
-        except Exception:
-            pass
+                # Unix: 发送 SIGKILL 到进程组
+                import signal
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    success = True
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                        success = True
+                    except Exception:
+                        pass
+            
+            # 确保进程已终止
+            if not success:
+                logger = logging.getLogger(__name__)
+                logger.error("无法终止进程 %d，进程可能仍在运行", proc_pid)
+                
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error("清理进程时出错：%s", e)
+        
+        # 尝试读取剩余输出（可选）
         try:
-            proc.communicate(timeout=3)
+            proc.communicate(timeout=1)
         except Exception:
             pass
+        
         return None
+    
     return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
 
 
@@ -571,24 +613,37 @@ def grade_exam(exam: Exam, strictness: str = "normal") -> list[Result]:
         ``"normal"`` — 归一化后精确比对（默认）。
         ``"lenient"`` — 归一化 + SequenceMatcher 阈值 0.8。
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info("开始判分，题目数量：%d, 严格度：%s", len(exam.questions), strictness)
+    
     results = []
-    for q in exam.questions:
+    for idx, q in enumerate(exam.questions):
         q_type = q.q_type
         score = q.score
         user_ans_raw = exam.get_answer(q.number)
+        
+        logger.debug("处理题目 %d [%s]: 答案=%r", idx+1, q_type, user_ans_raw)
 
         # 初始化结果字段
         is_correct = False
         is_half = False
         earned_score = 0.0
 
-        if user_ans_raw:
+        # 修复：显式检查 None 和空字符串
+        if user_ans_raw and isinstance(user_ans_raw, str) and user_ans_raw.strip():
+            logger.debug("  题目 %d 有答案，开始判分", idx+1)
             if strictness == "strict":
                 is_correct, is_half, earned_score = _grade_strict(q, user_ans_raw)
             elif strictness == "lenient":
                 is_correct, is_half, earned_score = _grade_lenient(q, user_ans_raw)
             else:
                 is_correct, is_half, earned_score = _grade_normal(q, user_ans_raw)
+            logger.debug("  题目 %d 判分完成：正确=%s, 半对=%s, 得分=%.1f", 
+                        idx+1, is_correct, is_half, earned_score)
+        else:
+            logger.debug("  题目 %d 无答案，得 0 分", idx+1)
 
         results.append(
             Result(
@@ -603,6 +658,11 @@ def grade_exam(exam: Exam, strictness: str = "normal") -> list[Result]:
                 is_half=is_half,
             )
         )
+    
+    total_score = sum(r.earned_score for r in results)
+    logger.info("判分完成，共%d题，总得分=%.1f/%d", len(results), total_score, 
+                sum(r.score for r in results))
+    
     return results
 
 
